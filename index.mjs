@@ -1,42 +1,20 @@
 /* global fetch */
 
-import {
-  S3Client,
-  GetObjectCommand,
-  PutObjectCommand,
-} from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { SSMClient, GetParametersCommand } from "@aws-sdk/client-ssm";
 import { simpleParser } from "mailparser";
 import OpenAI from "openai";
 import { google } from "googleapis";
 import { GoogleAuth } from "google-auth-library";
-import path from "path";
-import crypto from "crypto";
-import querystring from "querystring";
 
 const YOIN = "要員";
 const ANKEN = "案件";
 
 const SPREADSHEET_ID = "1qwV_yNutfk7QpKQ2qQPRQx7wym0u4px5h5dIqDacy4s";
 
-// 添付ファイル関連の設定
-const ATTACHMENT_PREFIX = "attachments/";
-const REGION = "ap-northeast-1";
-const OFFICE_VIEWER_URL = "https://view.officeapps.live.com/op/view.aspx?src=";
-const SUPPORTED_EXTENSIONS = [
-  ".xlsx",
-  ".xls",
-  ".docx",
-  ".doc",
-  ".pptx",
-  ".ppt",
-  ".pdf",
-];
-
 let keys = undefined;
-const s3Client = new S3Client({ region: REGION });
-const ssmClient = new SSMClient({ region: REGION });
+const s3Client = new S3Client();
+const ssmClient = new SSMClient();
 let openAIClient = undefined;
 let spreadsheetClient = undefined;
 let fileUrl = undefined;
@@ -48,93 +26,22 @@ export const handler = async (event, context) => {
   const key = decodeURIComponent(
     event.Records[0].s3.object.key.replace(/\+/g, " ")
   );
-  fileUrl = `https://${bucket}.s3.${REGION}.amazonaws.com/${key}`;
+  fileUrl = "https://saiteki-email.s3.ap-northeast-1.amazonaws.com/" + key;
   console.log(`handling object = ${key}, bucket = ${bucket}`);
 
   try {
     const mail = await getMail(bucket, key);
     console.log(`subject: ${mail.subject}`);
 
-    // メールの添付ファイルを処理
-    const attachmentUrls = await processAttachments(bucket, mail);
-    console.log(`Processed ${attachmentUrls.length} attachments`);
-
     const classification = await predictClassification(mail.subject);
     console.log(`predicted classification: ${classification}`);
 
-    await handleClassification(classification, mail, attachmentUrls);
+    await handleClassification(classification, mail);
   } catch (err) {
     const message = `Error: object = ${key}, bucket = ${bucket} err = ${err}`;
     console.log(message);
     throw new Error(message);
   }
-};
-
-// メールから添付ファイルを抽出し、Office Web ViewerのURLを生成する関数
-const processAttachments = async (bucket, mail) => {
-  const attachmentUrls = [];
-
-  if (mail.attachments && mail.attachments.length > 0) {
-    console.log(`Found ${mail.attachments.length} attachments in email`);
-
-    for (const attachment of mail.attachments) {
-      try {
-        const filename = attachment.filename;
-        const extension = path.extname(filename).toLowerCase();
-
-        // サポートされている拡張子かチェック
-        if (SUPPORTED_EXTENSIONS.includes(extension)) {
-          console.log(`Processing supported attachment: ${filename}`);
-
-          // S3に保存するためのユニークなキーを生成
-          const timestamp = new Date().getTime();
-          const randomStr = crypto.randomBytes(8).toString("hex");
-          const s3Key = `${ATTACHMENT_PREFIX}${timestamp}_${randomStr}_${filename}`;
-
-          // S3に添付ファイルを保存
-          await s3Client.send(
-            new PutObjectCommand({
-              Bucket: bucket,
-              Key: s3Key,
-              Body: attachment.content,
-              ContentType: attachment.contentType || "application/octet-stream",
-            })
-          );
-
-          // 署名付きURLを生成（1週間有効）
-          const command = new GetObjectCommand({
-            Bucket: bucket,
-            Key: s3Key,
-          });
-
-          const signedUrl = await getSignedUrl(s3Client, command, {
-            expiresIn: 604800,
-          }); // 7日間 = 604800秒
-
-          // Office Web ViewerのURLを生成
-          const encodedUrl = encodeURIComponent(signedUrl);
-          const officeViewerUrl = `${OFFICE_VIEWER_URL}${encodedUrl}`;
-
-          attachmentUrls.push({
-            filename,
-            contentType: attachment.contentType,
-            size: attachment.size,
-            s3Key,
-            signedUrl,
-            officeViewerUrl,
-          });
-
-          console.log(`Generated Office Web Viewer URL for ${filename}`);
-        } else {
-          console.log(`Skipping unsupported attachment: ${filename}`);
-        }
-      } catch (error) {
-        console.error(`Error processing attachment: ${error}`);
-      }
-    }
-  }
-
-  return attachmentUrls;
 };
 
 const init = async () => {
@@ -250,12 +157,12 @@ ${subject}`,
   }
 };
 
-const handleClassification = async (classification, mail, attachmentUrls) => {
+const handleClassification = async (classification, mail) => {
   switch (classification) {
     case YOIN:
-      return await handleYoinClassification(mail, attachmentUrls);
+      return await handleYoinClassification(mail);
     case ANKEN:
-      return await handleAnkenClassification(mail, attachmentUrls);
+      return await handleAnkenClassification(mail);
     default:
       console.log(
         `other classification = ${classification}, subject = ${mail.subject}`
@@ -263,7 +170,7 @@ const handleClassification = async (classification, mail, attachmentUrls) => {
   }
 };
 
-const handleAnkenClassification = async (mail, attachmentUrls) => {
+const handleAnkenClassification = async (mail) => {
   const anken = await summarizeAnken(
     mail.subject,
     mail.text,
@@ -271,7 +178,7 @@ const handleAnkenClassification = async (mail, attachmentUrls) => {
     mail.to.value[0].address
   );
   console.log(`anken summary: ${JSON.stringify(anken)}`);
-  await postAnken(anken, mail, attachmentUrls);
+  await postAnken(anken, mail);
   await appendToSpreadsheet(SPREADSHEET_ID, "案件!A2:A", [
     [
       mail.date,
@@ -283,13 +190,11 @@ const handleAnkenClassification = async (mail, attachmentUrls) => {
       anken.email,
       anken.age,
       anken.subject,
-      attachmentUrls.length > 0 ? "あり" : "なし",
     ],
   ]);
   return anken;
 };
-
-const handleYoinClassification = async (mail, attachmentUrls) => {
+const handleYoinClassification = async (mail) => {
   const yoin = await summarizeYoin(
     mail.subject,
     mail.text,
@@ -297,7 +202,7 @@ const handleYoinClassification = async (mail, attachmentUrls) => {
     mail.to.value[0].address
   );
   console.log(`yoin summary: ${JSON.stringify(yoin)}`);
-  await postYoin(yoin, mail, attachmentUrls);
+  await postYoin(yoin, mail);
   await appendToSpreadsheet(SPREADSHEET_ID, "要員!A2:A", [
     [
       mail.date,
@@ -309,7 +214,6 @@ const handleYoinClassification = async (mail, attachmentUrls) => {
       yoin.remote,
       yoin.age,
       yoin.subject,
-      attachmentUrls.length > 0 ? "あり" : "なし",
     ],
   ]);
   return yoin;
@@ -341,7 +245,7 @@ const summarizeYoin = async (subject, text, from, to) => {
 #各種ルール
 *{subject}は、${subject}を入力してください。
 *{email}は、${from}を入力してください。
-*{remote}は、メールの本文から要員がリモート勤務に対してどのような希望を持っているか読み取って"常駐可能"か"基本リモート"か"一部リモート"か"フルリモート"のいずれかの文字を入力してください。
+*{remote}は、メールの本文から要員がリモート勤務に対してどのような希望を持っているか読み取って“常駐可能“か”基本リモート“か”一部リモート“か”フルリモート“のいずれかの文字を入力してください。
 *{location}は、メールの本文からエンジニアの最寄駅を読み取って駅名や地域を入力してください。
 *{start_time}は、メールの本文から稼働の開始時期を入力してください。
 *{reward}は、メールの本文から希望の報酬額を読み取り「万円」単位で表示した際の数字部分のみを2桁か3桁で入力してください（例：450,000円は45、1,000,000円は100）。範囲指定されている場合は、下限の金額のみを入力してください（例：40〜50万円は、40）。
@@ -407,7 +311,7 @@ const summarizeAnken = async (subject, text, from, to) => {
 #各種ルール
 *{subject}は、${subject}を入力してください。
 *{email}は、${from}を入力してください。
-*{remote}は、メールの本文から案件情報を読み取り、リモート勤務に対してどのような要請のある案件かを読み取って"常駐"か"基本リモート"か"一部リモート"か"フルリモート"のいずれかの文字を入力してください。
+*{remote}は、メールの本文から案件情報を読み取り、リモート勤務に対してどのような要請のある案件かを読み取って“常駐“か”基本リモート“か”一部リモート“か”フルリモート“のいずれかの文字を入力してください。
 *{location}は、メールの本文から案件の稼働現場を読み取って駅名や地域を入力してください。
 *{start_time}は、メールの本文から稼働の開始時期を入力してください。
 **{reward}は、メールの本文から希望の報酬額を読み取り「万円」単位で表示した際の数字部分のみを2桁か3桁で入力してください（例：450,000円は45、1,000,000円は100）。範囲指定されている場合は、上限の金額のみを入力してください（例：40〜50万円は、50）。
@@ -492,12 +396,13 @@ const post = async (url, data) => {
   });
 };
 
-const postYoin = async (summary, mail, attachmentUrls = []) => {
+const postYoin = async (summary, mail) => {
   return await post(
     "https://app.saitekiinc.com/version-test/api/1.1/obj/要員情報",
     {
       報酬: summary.reward,
       場所: summary.location,
+      // "本文": mail.content,
       本文: mail.text || mail.textAsHtml,
       開始時期: summary.start_time,
       メール受信日時: mail.date,
@@ -507,26 +412,17 @@ const postYoin = async (summary, mail, attachmentUrls = []) => {
       年齢制限: summary.age,
       件名: summary.subject,
       メールurl: fileUrl,
-      添付ファイル数: attachmentUrls.length,
-      添付ファイル情報:
-        attachmentUrls.length > 0
-          ? JSON.stringify(
-              attachmentUrls.map((a) => ({
-                filename: a.filename,
-                officeViewerUrl: a.officeViewerUrl,
-              }))
-            )
-          : null,
     }
   );
 };
 
-const postAnken = async (summary, mail, attachmentUrls = []) => {
+const postAnken = async (summary, mail) => {
   return await post(
     "https://app.saitekiinc.com/version-test/api/1.1/obj/案件情報",
     {
       報酬: summary.reward,
       場所: summary.location,
+      //"本文": mail.content,
       本文: mail.text || mail.textAsHtml,
       開始時期: summary.start_time,
       リモート可否: summary.remote,
@@ -535,17 +431,6 @@ const postAnken = async (summary, mail, attachmentUrls = []) => {
       メールアドレス: summary.email,
       年齢制限: summary.age,
       件名: summary.subject,
-      メールurl: fileUrl,
-      添付ファイル数: attachmentUrls.length,
-      添付ファイル情報:
-        attachmentUrls.length > 0
-          ? JSON.stringify(
-              attachmentUrls.map((a) => ({
-                filename: a.filename,
-                officeViewerUrl: a.officeViewerUrl,
-              }))
-            )
-          : null,
     }
   );
 };
